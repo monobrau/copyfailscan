@@ -1,0 +1,5 @@
+# Never commit real credentials
+copyfail-creds
+**/copyfail-creds
+.env
+*.pem

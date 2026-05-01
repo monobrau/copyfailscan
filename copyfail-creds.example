@@ -1,0 +1,6 @@
+# Example credentials file for copyfail_scan.sh
+# Copy to a path you control (e.g. /etc/copyfail-creds), chmod 600, root-owned if desired.
+# One record per line: user:password   (only the first colon separates user from password)
+#
+# cknospe:your_password_here
+# root:another_password_here
