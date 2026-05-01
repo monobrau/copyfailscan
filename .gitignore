@@ -3,3 +3,4 @@ copyfail-creds
 **/copyfail-creds
 .env
 *.pem
+*.zip
