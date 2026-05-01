@@ -4,7 +4,7 @@
 
 **CVE scope:** CVE-2026-31431 is a **local** privilege escalation in the kernel crypto userspace API (`algif_aead`). It is not remote code execution by itself. Treat credentials, the credentials file, and scan output as sensitive.
 
-**Version:** current release **v1.0.0** (see GitHub Releases).
+**Version:** current release **[v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0)** (GitHub Releases).
 
 ## Requirements
 
