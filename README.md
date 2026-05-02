@@ -103,9 +103,10 @@ Strings below match what the current script prints (ANSI colors in the terminal)
 | **PRE-FIX KERNEL RANGE** | Heuristic treats kernel as older than the affected floor used by this script (approx. **4.14** floor in the script’s `classify_kernel` logic). |
 | **NO algif_aead - VERIFY** | Probe did not see `algif_aead` via `lsmod`, `modinfo`, or `/boot/config-$(uname -r)`. Could be a minimal image or odd config—**do not** assume “safe” without checking the advisory and kernel package. |
 | **UNKNOWN** | Heuristic could not classify the kernel triplet. |
-| **SKIP** | No credential line succeeded over SSH, or the remote probe returned nothing useful. |
+| **SKIP - NOT LINUX** | **SSH login succeeded** (a credential worked) but `uname -s` is not `Linux` (e.g. **macOS**, **Windows** Git Bash/MSYS, or **BSD**). This CVE targets the **Linux** kernel only. |
+| **SKIP** | **No** credential succeeded. The line explains **why** when possible: e.g. **SSH authentication failed** for every entry in `CREDS_FILE` (wrong password, unknown user, key-only account), **TCP refused/timeout**, **DNS failure**, **bash missing** on the remote, or another SSH error. |
 
-Remote facts collected per host: `uname -r`, `PRETTY_NAME` from `/etc/os-release`, `hostname`, `algif_aead` signals, mitigation hints.
+Remote facts collected per host (when Linux): `uname -r`, `PRETTY_NAME` from `/etc/os-release`, `hostname`, `algif_aead` signals, mitigation hints.
 
 ## Kernel heuristic (v1.0.0)
 

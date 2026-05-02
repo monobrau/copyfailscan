@@ -115,7 +115,16 @@ preauth_skip_message() {
 }
 
 # Remote probe - kept in a variable so `RESULT=$(ssh_try_host "$ip")` does not steal a heredoc.
-REMOTE_SCRIPT=$'KVER=$(uname -r)
+REMOTE_SCRIPT=$'US=$(uname -s 2>/dev/null || echo unknown)
+if [[ "$US" != "Linux" ]]; then
+  UR=$(uname -r 2>/dev/null || echo "?")
+  HN=$(hostname 2>/dev/null || echo "unknown")
+  PN=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Unknown")
+  PN=${PN//|/ }
+  echo "NOTLINUX|${US}|${UR}|${HN}|${PN}"
+  exit 0
+fi
+KVER=$(uname -r)
 DISTRO=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Unknown")
 HNAME=$(hostname 2>/dev/null || echo "unknown")
 
@@ -219,15 +228,70 @@ classify_kernel() {
     echo "unknown"
 }
 
+# Summarize ssh/sshpass stderr for operators (auth vs network vs other).
+classify_ssh_failure() {
+    local rc="$1"
+    local err="$2"
+    local host="${3:-}"
+    if grep -qi 'connection refused' <<<"$err"; then
+        echo "TCP: connection refused on port 22 (service down or nothing listening)"
+        return 0
+    fi
+    if grep -qi 'connection timed out\|operation timed out\|timed out while waiting' <<<"$err"; then
+        echo "TCP: connection timed out (host offline, firewall, or filtering)"
+        return 0
+    fi
+    if grep -qi 'no route to host' <<<"$err"; then
+        echo "Network: no route to host"
+        return 0
+    fi
+    if grep -qi 'could not resolve\|name or service not known\|temporary failure in name resolution' <<<"$err"; then
+        echo "DNS: name resolution failed"
+        return 0
+    fi
+    if grep -qi 'permission denied' <<<"$err"; then
+        echo "SSH: authentication failed for every entry in CREDS_FILE (wrong password/user, disabled account, or key-only access)"
+        return 0
+    fi
+    if grep -qi 'too many authentication failures' <<<"$err"; then
+        echo "SSH: too many authentication failures (try fewer credential lines or lower MaxAuthTries on server)"
+        return 0
+    fi
+    if grep -qi 'no matching host key\|host key verification failed' <<<"$err"; then
+        echo "SSH: host key verification issue (unexpected if StrictHostKeyChecking=no — check man-in-the-middle)"
+        return 0
+    fi
+    if grep -qi 'could not chdir\|no shell\|not interactive' <<<"$err"; then
+        echo "SSH: login or shell restriction on server"
+        return 0
+    fi
+    if grep -qi 'bash:.*/bin/bash\|bash: command not found\|No such file or directory.*bash' <<<"$err"; then
+        echo "SSH: remote cannot run bash (often non-Linux or minimal appliance — use a Linux host or install bash)"
+        return 0
+    fi
+    local first
+    first=$(printf '%s' "$err" | head -1 | tr -d '\r' | cut -c1-120)
+    if [[ -n "$first" ]]; then
+        echo "SSH failed (exit ${rc}): ${first}"
+    else
+        echo "SSH failed (exit ${rc}), no stderr captured — try: ssh -vv user@${host:-host}"
+    fi
+}
+
+# Sets globals SSH_PROBE_RESULT (stdout from remote) and SSH_LAST_FAILURE_DETAIL on failure.
+# Do not call via command substitution — subshell would discard globals.
 ssh_try_host() {
     local HOST="$1"
-    local line user pass out rc
+    local line user pass out rc err errf
+    SSH_PROBE_RESULT=""
+    SSH_LAST_FAILURE_DETAIL=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "${line//[$'\t\r\n ']}" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         user="${line%%:*}"
         pass="${line#*:}"
         [[ -z "$user" ]] && continue
+        errf="${TMPDIR:-/tmp}/cfs-$$-${RANDOM}.err"
         # Disable errexit: failed SSH must not kill the whole scan under `set -e`.
         set +e
         out="$(SSHPASS="$pass" sshpass -e ssh \
@@ -235,20 +299,27 @@ ssh_try_host() {
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            "${user}@${HOST}" bash <<<"$REMOTE_SCRIPT" 2>/dev/null)"
+            "${user}@${HOST}" bash <<<"$REMOTE_SCRIPT" 2>"$errf")"
         rc=$?
+        err="$(cat "$errf" 2>/dev/null || true)"
+        rm -f "$errf"
         set -e
+        SSH_LAST_FAILURE_DETAIL="$(classify_ssh_failure "$rc" "$err" "$HOST")"
         if [[ $rc -eq 0 && -n "$out" ]]; then
-            printf '%s\n' "$out"
+            SSH_PROBE_RESULT="$out"
+            SSH_LAST_FAILURE_DETAIL=""
             return 0
         fi
     done <"$CREDS_FILE"
+    if [[ -z "$SSH_LAST_FAILURE_DETAIL" ]]; then
+        SSH_LAST_FAILURE_DETAIL="No usable credential lines in CREDS_FILE, or SSH produced no parseable error"
+    fi
     return 1
 }
 
 check_host() {
     local HOST="$1"
-    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr
+    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr rc_ssh _tag NL_US NL_UR NL_HN NL_OS
 
     set +e
     PRE_REASON="$(preauth_skip_message "$HOST")"
@@ -260,8 +331,19 @@ check_host() {
     fi
 
     RESULT=""
-    if ! RESULT="$(ssh_try_host "$HOST")"; then
-        echo -e "  ${HOST}: ${YEL}[SKIP]${NC} No SSH auth succeeded (or probe failed)"
+    set +e
+    ssh_try_host "$HOST"
+    rc_ssh=$?
+    set -e
+    if [[ $rc_ssh -ne 0 ]]; then
+        echo -e "  ${HOST}: ${YEL}[SKIP]${NC} ${SSH_LAST_FAILURE_DETAIL:-SSH failed (no detail)}"
+        return 0
+    fi
+    RESULT="$SSH_PROBE_RESULT"
+
+    if [[ "$RESULT" == NOTLINUX\|* ]]; then
+        IFS='|' read -r _tag NL_US NL_UR NL_HN NL_OS <<<"$RESULT"
+        echo -e "  ${HOST} (${NL_HN}): ${CYA}[SKIP - NOT LINUX]${NC} login OK; uname -s=${NL_US}, uname -r=${NL_UR} | ${NL_OS}"
         return 0
     fi
 
