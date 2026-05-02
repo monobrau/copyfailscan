@@ -45,7 +45,6 @@ read_ssh_banner() {
             line="$(nc -w4 "$host" 22 </dev/null 2>/dev/null | head -1)"
         fi
     fi
-    set -e
     line="${line//$'\r'/}"
     line="${line//$'\n'/}"
     [[ -z "$line" ]] && return 1
@@ -78,7 +77,6 @@ nmap_skip_reason() {
     command -v nmap >/dev/null 2>&1 || return 1
     set +e
     out=$(nmap -p22 -sV -Pn --version-light --host-timeout 8 "$host" 2>/dev/null)
-    set -e
     [[ -z "$out" ]] && return 1
     if grep -qiE 'microsoft|openssh.*for windows|windows[[:space:]]*ssh' <<<"$out"; then
         echo "non-Linux (nmap: Windows / Microsoft SSH)"
@@ -100,7 +98,7 @@ preauth_skip_message() {
         if msg="$(banner_skip_reason "$banner")"; then
             if [[ "$COPYFAIL_PREAUTH_VERBOSE" == "1" ]]; then
                 local short="$banner"
-                ((${#short} > 72)) && short="${short:0:72}..."
+                if (( ${#short} > 72 )); then short="${short:0:72}..."; fi
                 msg="$msg | banner: $short"
             fi
             printf '%s\n' "$msg"
@@ -286,19 +284,28 @@ classify_ssh_failure() {
 
 # Sets globals SSH_PROBE_RESULT (stdout from remote) and SSH_LAST_FAILURE_DETAIL on failure.
 # Do not call via command substitution — subshell would discard globals.
+# Note: never run bare `set -e` here — it leaks into the caller and can abort the script mid-loop.
 ssh_try_host() {
     local HOST="$1"
-    local line user pass out rc err errf
+    local line user pass out rc err errf credopen
     SSH_PROBE_RESULT=""
     SSH_LAST_FAILURE_DETAIL=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
+    # Opening CREDS_FILE must not abort the whole script under errexit (use explicit check).
+    set +e
+    exec 4<"$CREDS_FILE"
+    credopen=$?
+    set +e
+    if [[ $credopen -ne 0 ]]; then
+        SSH_LAST_FAILURE_DETAIL="Cannot read CREDS_FILE: $CREDS_FILE (permission denied). Run: sudo $0   OR   sudo chown $(id -un):$(id -gn) $CREDS_FILE && chmod 600 $CREDS_FILE"
+        return 1
+    fi
+    while IFS= read -r line <&4 || [[ -n "$line" ]]; do
         [[ -z "${line//[$'\t\r\n ']}" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         user="${line%%:*}"
         pass="${line#*:}"
         [[ -z "$user" ]] && continue
         errf="${TMPDIR:-/tmp}/cfs-$$-${RANDOM}.err"
-        # Disable errexit: failed SSH must not kill the whole scan under `set -e`.
         set +e
         out="$(SSHPASS="$pass" sshpass -e ssh \
             -o ConnectTimeout=5 \
@@ -309,14 +316,15 @@ ssh_try_host() {
         rc=$?
         err="$(cat "$errf" 2>/dev/null || true)"
         rm -f "$errf"
-        set -e
         SSH_LAST_FAILURE_DETAIL="$(classify_ssh_failure "$rc" "$err" "$HOST")"
         if [[ $rc -eq 0 && -n "$out" ]]; then
             SSH_PROBE_RESULT="$out"
             SSH_LAST_FAILURE_DETAIL=""
+            exec 4<&-
             return 0
         fi
-    done <"$CREDS_FILE"
+    done
+    exec 4<&-
     if [[ -z "$SSH_LAST_FAILURE_DETAIL" ]]; then
         SSH_LAST_FAILURE_DETAIL="No usable credential lines in CREDS_FILE, or SSH produced no parseable error"
     fi
