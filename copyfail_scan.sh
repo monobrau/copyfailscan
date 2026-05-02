@@ -157,6 +157,12 @@ require_file() {
         echo "Credentials file must be chmod 600 (got $mode): $CREDS_FILE" >&2
         exit 1
     fi
+    if [[ ! -r "$CREDS_FILE" ]]; then
+        echo "Credentials file is not readable by this user ($(id -un)): $CREDS_FILE" >&2
+        echo "  Files owned by root with mode 600 cannot be read without privileges." >&2
+        echo "  Options:  sudo $0 ...   OR   sudo chown $(id -un):$(id -gn) $CREDS_FILE   (keep chmod 600)" >&2
+        exit 1
+    fi
 }
 
 require_cmds() {

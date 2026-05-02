@@ -44,7 +44,7 @@ If no rule matches, the script continues with normal SSH as before.
    sudo chown root:root /etc/copyfail-creds   # optional
    ```
 
-4. **Who can read it:** if the file is owned by **root** with mode `600`, run the scanner with **`sudo`** so it can read the file. Alternatively, keep the file owned by your user with `600` and run without `sudo`.
+4. **Who can read it:** if the file is owned by **root** with mode `600`, **only root can read it**. Run **`sudo ./copyfail_scan.sh`** (with `CREDS_FILE` set if needed), **or** `sudo chown youruser:yourgroup /etc/copyfail-creds` while keeping **`chmod 600`**.
 
 5. **Cleanup:** remove `/etc/copyfail-creds` when you no longer need batch password auth.
 
