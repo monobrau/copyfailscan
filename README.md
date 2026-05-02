@@ -4,17 +4,27 @@
 
 **CVE scope:** CVE-2026-31431 is a **local** privilege escalation in the kernel crypto userspace API (`algif_aead`). It is not remote code execution by itself. Treat credentials, the credentials file, and scan output as sensitive.
 
-**Version:** current release **[v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0)** (GitHub Releases).
+**Version:** current release **[v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0)** (GitHub Releases). **Pre-auth OS filtering** (banner / optional `nmap`) is newer than that tag; cut a new release or clone `main` for the latest script.
 
 ## Requirements
 
 | Component | When |
 |-----------|------|
 | `bash` (4+), `ssh`, `sshpass` | Always |
-| `nmap` | Only when **TARGET** is a **CIDR** (e.g. `192.168.54.0/23`). The script exits with an error if you pass a CIDR and `nmap` is missing. |
+| `nmap` | Only when **TARGET** is a **CIDR** (e.g. `192.168.54.0/23`), **or** when **`COPYFAIL_PREAUTH_NMAP=1`** (optional per-host service probe). The script exits with an error if you pass a CIDR and `nmap` is missing. |
 | Reachable SSH on targets | Always (TCP discovery uses port **22** for CIDR sweeps: `nmap -sn -PS22`) |
 
-Scanning a **single IP or hostname** does not require `nmap`. Scanning a **host list file** does not require `nmap`.
+Scanning a **single IP or hostname** does not require `nmap` **unless** you enable **`COPYFAIL_PREAUTH_NMAP=1`**. Scanning a **host list file** does not require `nmap` for discovery (same exception applies if `COPYFAIL_PREAUTH_NMAP=1`).
+
+## Pre-auth filtering (before SSH)
+
+This CVE applies to the **Linux kernel**, so the script tries to avoid wasting credential attempts on obvious non-Linux SSH servers.
+
+1. **SSH banner (default, fast)** — Opens **TCP/22** and reads the SSH identification string (RFC 4253 first line, no crypto handshake). If it matches common patterns (**Windows** / Microsoft OpenSSH, **Cygwin**, many **network appliances**), the host is reported as **`[SKIP - PRE-AUTH]`** and **never** runs `sshpass`.
+
+2. **Optional `nmap` service probe** — **macOS** and some other systems often present the same generic `SSH-2.0-OpenSSH_…` banner as Linux, so they cannot be separated by banner alone. Set **`COPYFAIL_PREAUTH_NMAP=1`** to run **`nmap -p22 -sV`** per host (slower, requires `nmap`) and skip targets whose fingerprint text suggests **Windows** or **macOS/Apple**.
+
+If no rule matches, the script continues with normal SSH as before.
 
 ## Credentials file
 
@@ -71,13 +81,22 @@ CREDS_FILE=/etc/copyfail-creds ./copyfail_scan.sh 192.168.54.93
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `CREDS_FILE` | `/etc/copyfail-creds` | Path to the `user:password` file |
+| `COPYFAIL_PREAUTH` | `1` | If `1`, read SSH banner on port 22 and skip obvious non-Linux targets before `sshpass`. Set to `0` to disable. |
+| `COPYFAIL_PREAUTH_NMAP` | `0` | If `1` and `nmap` is installed, run `nmap -p22 -sV` when banner did not justify a skip (helps detect **macOS** and some Windows installs). **Slow** on large subnets. |
+| `COPYFAIL_PREAUTH_VERBOSE` | `0` | If `1`, append a truncated copy of the SSH banner to `[SKIP - PRE-AUTH]` lines (debugging). |
+
+```bash
+# Example: also use nmap to skip macOS / ambiguous OpenSSH banners (needs nmap installed)
+COPYFAIL_PREAUTH_NMAP=1 CREDS_FILE=/etc/copyfail-creds sudo ./copyfail_scan.sh 192.168.54.0/23
+```
 
 ## Output legend
 
-Strings below match what **v1.0.0** prints (ANSI colors in the terminal).
+Strings below match what the current script prints (ANSI colors in the terminal).
 
 | Tag | Meaning |
 |-----|--------|
+| **SKIP - PRE-AUTH** | Host skipped **before** SSH: SSH banner (and optionally `nmap -sV`) matched **non-Linux** / **non-target** patterns (Windows, Cygwin, common appliances, or macOS via `nmap` when enabled). |
 | **LIKELY VULNERABLE** | Kernel matches the script’s **heuristic** “affected” branch **and** `algif_aead` appears present (`loaded`, `loadable`, or `builtin`). **Confirm** with your distributor’s security advisory. |
 | **VULN - MITIGATED** | Same idea as vulnerable kernel band, but `/etc/modprobe.d` or `initcall_blacklist=algif_aead_init` on the kernel cmdline was detected. |
 | **PATCHED / LIKELY OK** | Heuristic says fixed (e.g. **6.18.22+**, **6.19.12+**, **6.20+** within 6.x, or **7.x**). Distro backports may still use unusual `uname -r` strings—verify with your vendor. |

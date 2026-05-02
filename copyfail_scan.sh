@@ -12,16 +12,107 @@
 #   - single IP / hostname
 #   - path to a host list file (one host/IP per line, # comments ok)
 #
+# Optional environment:
+#   COPYFAIL_PREAUTH=1          Pre-scan TCP/22 SSH banner; skip obvious non-Linux (default 1)
+#   COPYFAIL_PREAUTH_NMAP=0     If 1 and nmap exists, nmap -sV -p22 for Windows/macOS hints (slower)
+#   COPYFAIL_PREAUTH_VERBOSE=0  If 1, show truncated SSH banner on pre-auth skips
+#
 set -euo pipefail
 
 TARGET="${1:-192.168.54.0/23}"
 CREDS_FILE="${CREDS_FILE:-/etc/copyfail-creds}"
+COPYFAIL_PREAUTH="${COPYFAIL_PREAUTH:-1}"
+COPYFAIL_PREAUTH_NMAP="${COPYFAIL_PREAUTH_NMAP:-0}"
+COPYFAIL_PREAUTH_VERBOSE="${COPYFAIL_PREAUTH_VERBOSE:-0}"
 
 RED='\033[0;31m'
 YEL='\033[1;33m'
 GRN='\033[0;32m'
 CYA='\033[0;36m'
 NC='\033[0m'
+
+# Read SSH identification string (first line) from TCP/22 - no cryptographic auth.
+read_ssh_banner() {
+    local host="$1" line=""
+    set +e
+    exec 3<>/dev/tcp/"$host"/22 2>/dev/null
+    if [[ $? -eq 0 ]]; then
+        IFS= read -r -t 4 line <&3
+        exec 3<&-
+        exec 3>&-
+    else
+        if command -v nc >/dev/null 2>&1; then
+            line="$(nc -w4 "$host" 22 </dev/null 2>/dev/null | head -1)"
+        fi
+    fi
+    set -e
+    line="${line//$'\r'/}"
+    line="${line//$'\n'/}"
+    [[ -z "$line" ]] && return 1
+    printf '%s\n' "$line"
+    return 0
+}
+
+# Echo skip reason to stdout, exit 0 if this banner should skip Linux CVE probe; else exit 1 with no output.
+banner_skip_reason() {
+    local b="$1" lb
+    lb=$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')
+    if [[ "$lb" =~ openssh_for_windows|openssh.*for.windows|_for_windows_|microsoft|windows_ssh ]]; then
+        echo "non-Linux (SSH banner: Windows / Microsoft OpenSSH)"
+        return 0
+    fi
+    if [[ "$lb" =~ cygwin ]]; then
+        echo "non-Linux (SSH banner: Cygwin)"
+        return 0
+    fi
+    if [[ "$lb" =~ cisco|routeros|mikrotik|fortinet|fortios|palo.alto|arista|junos|huawei|huaweissh|dellnetworkos ]]; then
+        echo "non-Linux (SSH banner: network appliance / switch / router)"
+        return 0
+    fi
+    return 1
+}
+
+# Optional nmap service fingerprint on port 22 (slow; helps macOS vs generic OpenSSH).
+nmap_skip_reason() {
+    local host="$1" out
+    command -v nmap >/dev/null 2>&1 || return 1
+    set +e
+    out=$(nmap -p22 -sV -Pn --version-light --host-timeout 8 "$host" 2>/dev/null)
+    set -e
+    [[ -z "$out" ]] && return 1
+    if grep -qiE 'microsoft|openssh.*for windows|windows[[:space:]]*ssh' <<<"$out"; then
+        echo "non-Linux (nmap: Windows / Microsoft SSH)"
+        return 0
+    fi
+    if grep -qiE 'mac os x|macos|apple remote login|os[[:space:]]*:[[:space:]]*mac|running:[[:space:]]*mac|darwin kernel' <<<"$out"; then
+        echo "non-Linux (nmap: macOS / Apple)"
+        return 0
+    fi
+    return 1
+}
+
+# Returns 0 and prints reason on stdout if we should skip before sshpass; else returns 1.
+preauth_skip_message() {
+    local host="$1" banner msg
+    [[ "$COPYFAIL_PREAUTH" == "1" ]] || return 1
+    msg=""
+    if banner="$(read_ssh_banner "$host" 2>/dev/null)"; then
+        if msg="$(banner_skip_reason "$banner")"; then
+            if [[ "$COPYFAIL_PREAUTH_VERBOSE" == "1" ]]; then
+                local short="$banner"
+                ((${#short} > 72)) && short="${short:0:72}..."
+                msg="$msg | banner: $short"
+            fi
+            printf '%s\n' "$msg"
+            return 0
+        fi
+    fi
+    if [[ "$COPYFAIL_PREAUTH_NMAP" == "1" ]] && msg="$(nmap_skip_reason "$host")"; then
+        printf '%s\n' "$msg"
+        return 0
+    fi
+    return 1
+}
 
 # Remote probe - kept in a variable so `RESULT=$(ssh_try_host "$ip")` does not steal a heredoc.
 REMOTE_SCRIPT=$'KVER=$(uname -r)
@@ -157,7 +248,16 @@ ssh_try_host() {
 
 check_host() {
     local HOST="$1"
-    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN
+    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr
+
+    set +e
+    PRE_REASON="$(preauth_skip_message "$HOST")"
+    pr=$?
+    set -e
+    if [[ $pr -eq 0 && -n "$PRE_REASON" ]]; then
+        echo -e "  ${HOST}: ${CYA}[SKIP - PRE-AUTH]${NC} ${PRE_REASON}"
+        return 0
+    fi
 
     RESULT=""
     if ! RESULT="$(ssh_try_host "$HOST")"; then
@@ -219,6 +319,7 @@ require_cmds
 
 echo "=== CVE-2026-31431 (Copy Fail) posture scan ==="
 echo "=== CREDS_FILE=${CREDS_FILE} | TARGET=${TARGET} ==="
+echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} ==="
 echo ""
 
 discover_hosts "$TARGET"
