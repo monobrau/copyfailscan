@@ -4,7 +4,16 @@
 
 **CVE scope:** CVE-2026-31431 is a **local** privilege escalation in the kernel crypto userspace API (`algif_aead`). It is not remote code execution by itself. Treat credentials, the credentials file, and scan output as sensitive.
 
-**Version:** current release **[v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0)** (GitHub Releases). **Pre-auth OS filtering** (banner / optional `nmap`) is newer than that tag; cut a new release or clone `main` for the latest script.
+**Version:** current release **[v1.1.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.1.0)** (GitHub Releases). See **Changes in v1.1.0** below.
+
+### Changes in v1.1.0
+
+- **Pre-auth:** optional skip of obvious non-Linux targets via SSH **banner** (and optional **`nmap -sV -p22`** with `COPYFAIL_PREAUTH_NMAP=1`) before `sshpass`.
+- **Clearer failures:** distinguish **bad credentials** vs **network/DNS/TCP** vs **CREDS not readable**; **no silent exit** if `/etc/copyfail-creds` is root-only and you run without `sudo` (script checks **read** access up front; **safe** creds file open in `ssh_try_host`).
+- **After login:** **`[SKIP - NOT LINUX]`** when `uname -s` ≠ `Linux` (e.g. macOS/Windows Git Bash) even if SSH works.
+- **Robustness:** removed leaked **`set -e`** inside SSH loops that could abort the scan mid-run with no output.
+
+Older release: [v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0).
 
 ## Requirements
 
@@ -108,7 +117,7 @@ Strings below match what the current script prints (ANSI colors in the terminal)
 
 Remote facts collected per host (when Linux): `uname -r`, `PRETTY_NAME` from `/etc/os-release`, `hostname`, `algif_aead` signals, mitigation hints.
 
-## Kernel heuristic (v1.0.0)
+## Kernel heuristic
 
 The script parses **`uname -r`** (e.g. `6.17.13-1-pve`, `7.0.0-14-generic`) and applies a **best-effort** map:
 
@@ -117,6 +126,8 @@ The script parses **`uname -r`** (e.g. `6.17.13-1-pve`, `7.0.0-14-generic`) and 
 - If **`algif_aead`** is not detected by the probe, status becomes **NO algif_aead - VERIFY** regardless of the kernel branch.
 
 Vendor kernels often **backport** fixes under build strings that do not match upstream numbers—**prefer your OS vendor’s CVE matrix** over this script alone.
+
+**Proxmox VE (`*-pve` kernels):** `uname -r` may stay on **6.8.x** or **6.17.x** while Debian/Proxmox security updates fix CVE-2026-31431 in the **`pve-kernel-*`** package. Treat **`[LIKELY VULNERABLE]`** on `*-pve` as “**confirm against Proxmox/Debian advisories and `dpkg -l pve-kernel-*`**,” not proof of an exploitable kernel.
 
 ## Mitigation hints (high level)
 

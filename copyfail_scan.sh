@@ -24,6 +24,7 @@ CREDS_FILE="${CREDS_FILE:-/etc/copyfail-creds}"
 COPYFAIL_PREAUTH="${COPYFAIL_PREAUTH:-1}"
 COPYFAIL_PREAUTH_NMAP="${COPYFAIL_PREAUTH_NMAP:-0}"
 COPYFAIL_PREAUTH_VERBOSE="${COPYFAIL_PREAUTH_VERBOSE:-0}"
+COPYFAIL_VERSION="1.1.0"
 
 RED='\033[0;31m'
 YEL='\033[1;33m'
@@ -413,7 +414,7 @@ discover_hosts() {
 require_file
 require_cmds
 
-echo "=== CVE-2026-31431 (Copy Fail) posture scan ==="
+echo "=== CVE-2026-31431 (Copy Fail) posture scan v${COPYFAIL_VERSION} ==="
 echo "=== CREDS_FILE=${CREDS_FILE} | TARGET=${TARGET} ==="
 echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} ==="
 echo ""
