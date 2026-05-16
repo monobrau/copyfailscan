@@ -14,19 +14,56 @@
 #   - single IP / hostname
 #   - path to a host list file (one host/IP per line, # comments ok)
 #
-# Optional environment:
+# Optional environment (defaults suit homelab scans; tighten for shared / unfamiliar networks):
 #   COPYFAIL_PREAUTH=1          Pre-scan TCP/22 SSH banner; skip obvious non-Linux (default 1)
-#   COPYFAIL_PREAUTH_NMAP=0     If 1 and nmap exists, nmap -sV -p22 for Windows/macOS hints (slower)
+#   COPYFAIL_PREAUTH_NMAP=1     If 1 and nmap exists, nmap -sV -p22 for Windows/macOS hints (default 1; slower).
+#                               Set 0 to skip nmap and rely on the SSH banner only.
 #   COPYFAIL_PREAUTH_VERBOSE=0  If 1, show truncated SSH banner on pre-auth skips
+#   COPYFAIL_PARALLEL=24        Max concurrent host probes (default 24). Set 1 for sequential / conservative runs.
+#   COPYFAIL_ORDERED_OUTPUT=1   When PARALLEL>1, print results in probe order (default 1). Set 0 for live interleaved output.
+#   COPYFAIL_PTR_LOOKUP=1       For IPv4 targets without a name from nmap/list, try reverse DNS via getent (default 1).
+#   COPYFAIL_SUMMARY=1          After hosts, print heuristic OK vs needs review/action (default 1). Set 0 to skip.
+#   COPYFAIL_BANNER_TIMEOUT=3     Seconds to wait for TCP/22 + first SSH identification line (nc or timeout+read).
+#   COPYFAIL_SSH_CONNECT_TIMEOUT=3  ssh ConnectTimeout (seconds); lower = faster skips on dead hosts.
+#   COPYFAIL_NO_BANNER_SKIP_SSH=1 When 1 and PREAUTH=1, do not attempt SSH if no banner (offline / filtered / no SSH).
+#                               Set 0 if some targets send a very slow SSH banner.
 #
 set -euo pipefail
 
 TARGET="${1:-192.168.54.0/23}"
 CREDS_FILE="${CREDS_FILE:-/etc/copyfail-creds}"
 COPYFAIL_PREAUTH="${COPYFAIL_PREAUTH:-1}"
-COPYFAIL_PREAUTH_NMAP="${COPYFAIL_PREAUTH_NMAP:-0}"
+COPYFAIL_PREAUTH_NMAP="${COPYFAIL_PREAUTH_NMAP:-1}"
 COPYFAIL_PREAUTH_VERBOSE="${COPYFAIL_PREAUTH_VERBOSE:-0}"
-COPYFAIL_VERSION="1.2.0"
+COPYFAIL_PARALLEL_RAW="${COPYFAIL_PARALLEL:-24}"
+if ! [[ "$COPYFAIL_PARALLEL_RAW" =~ ^[0-9]+$ ]] || (( COPYFAIL_PARALLEL_RAW < 1 )); then
+    COPYFAIL_PARALLEL=1
+elif (( COPYFAIL_PARALLEL_RAW > 64 )); then
+    COPYFAIL_PARALLEL=64
+else
+    COPYFAIL_PARALLEL=$COPYFAIL_PARALLEL_RAW
+fi
+COPYFAIL_BANNER_TIMEOUT_RAW="${COPYFAIL_BANNER_TIMEOUT:-3}"
+if ! [[ "$COPYFAIL_BANNER_TIMEOUT_RAW" =~ ^[0-9]+$ ]] || (( COPYFAIL_BANNER_TIMEOUT_RAW < 1 )); then
+    COPYFAIL_BANNER_TIMEOUT=3
+elif (( COPYFAIL_BANNER_TIMEOUT_RAW > 30 )); then
+    COPYFAIL_BANNER_TIMEOUT=30
+else
+    COPYFAIL_BANNER_TIMEOUT=$COPYFAIL_BANNER_TIMEOUT_RAW
+fi
+COPYFAIL_SSH_CONNECT_TIMEOUT_RAW="${COPYFAIL_SSH_CONNECT_TIMEOUT:-3}"
+if ! [[ "$COPYFAIL_SSH_CONNECT_TIMEOUT_RAW" =~ ^[0-9]+$ ]] || (( COPYFAIL_SSH_CONNECT_TIMEOUT_RAW < 1 )); then
+    COPYFAIL_SSH_CONNECT_TIMEOUT=3
+elif (( COPYFAIL_SSH_CONNECT_TIMEOUT_RAW > 60 )); then
+    COPYFAIL_SSH_CONNECT_TIMEOUT=60
+else
+    COPYFAIL_SSH_CONNECT_TIMEOUT=$COPYFAIL_SSH_CONNECT_TIMEOUT_RAW
+fi
+COPYFAIL_NO_BANNER_SKIP_SSH="${COPYFAIL_NO_BANNER_SKIP_SSH:-1}"
+COPYFAIL_ORDERED_OUTPUT="${COPYFAIL_ORDERED_OUTPUT:-1}"
+COPYFAIL_PTR_LOOKUP="${COPYFAIL_PTR_LOOKUP:-1}"
+COPYFAIL_SUMMARY="${COPYFAIL_SUMMARY:-1}"
+COPYFAIL_VERSION="1.2.2"
 
 RED='\033[0;31m'
 YEL='\033[1;33m'
@@ -34,18 +71,219 @@ GRN='\033[0;32m'
 CYA='\033[0;36m'
 NC='\033[0m'
 
+declare -gA CFS_DISPLAY_NAME
+
+# Optional reverse DNS for IPv4 when nmap/list did not supply a display name.
+cfs_enrich_ptr_labels() {
+    [[ "${COPYFAIL_PTR_LOOKUP:-1}" == "0" ]] && return 0
+    local h nm
+    for h in "${HOSTS[@]}"; do
+        [[ -z "${h// }" ]] && continue
+        [[ -n "${CFS_DISPLAY_NAME[$h]:-}" ]] && continue
+        [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        # getent returns non-zero when no PTR; with pipefail that would abort the whole script under set -e.
+        nm="$(getent hosts "$h" 2>/dev/null | awk -v ip="$h" '{
+            for (i = 2; i <= NF; i++) if ($i != ip) { print $i; exit }
+        }')" || nm=""
+        if [[ -n "$nm" && "$nm" != "$h" ]]; then
+            CFS_DISPLAY_NAME["$h"]="$nm"
+        fi
+    done
+}
+
+_cfs_tmp_cleanup() {
+    rm -rf "${COPYFAIL_RESULT_DIR:-}" "${CFS_SUMMARY_DIR:-}"
+    COPYFAIL_RESULT_DIR=""
+    CFS_SUMMARY_DIR=""
+}
+
+# Pairs file lines: MESSAGE<TAB>LABEL (LABEL = IP or "IP (hostname)"). Groups identical MESSAGE.
+cfs_summary_emit_grouped() {
+    local pairs="$1"
+    [[ -s "$pairs" ]] || return 1
+    sort -t $'\t' -k1,1 -k2,2 -u "$pairs" | awk -F '\t' '
+    {
+        if ($1 != key) {
+            if (key != "") print "- " hosts " — " key
+            key = $1
+            hosts = $2
+        } else {
+            hosts = hosts ", " $2
+        }
+    }
+    END {
+        if (key != "") print "- " hosts " — " key
+    }'
+}
+
+cfs_render_summary() {
+    [[ "${COPYFAIL_SUMMARY:-1}" == "0" ]] && return 0
+    [[ -z "${CFS_SUMMARY_DIR:-}" || ! -d "$CFS_SUMMARY_DIR" ]] && return 0
+    local good_pairs review_pairs f
+    good_pairs="$(mktemp "${TMPDIR:-/tmp}/cfs-goodp.XXXXXX")"
+    review_pairs="$(mktemp "${TMPDIR:-/tmp}/cfs-revp.XXXXXX")"
+    shopt -s nullglob
+    for f in "$CFS_SUMMARY_DIR"/*.sum; do
+        [[ -e "$f" ]] || continue
+        while IFS=$'\t' read -r kind label msg; do
+            [[ -z "$kind" ]] && continue
+            if [[ "$kind" == GOOD ]]; then
+                printf '%s\t%s\n' "$msg" "$label" >>"$good_pairs"
+            else
+                printf '%s\t%s\n' "$msg" "$label" >>"$review_pairs"
+            fi
+        done <"$f"
+    done
+    shopt -u nullglob
+    echo ""
+    echo "=== Summary report ==="
+    echo ""
+    echo "-- Confirmed good (heuristic) --"
+    if [[ -s "$good_pairs" ]]; then
+        cfs_summary_emit_grouped "$good_pairs"
+    else
+        echo "(none)"
+    fi
+    echo ""
+    echo "-- Needs review or action --"
+    if [[ -s "$review_pairs" ]]; then
+        cfs_summary_emit_grouped "$review_pairs"
+    else
+        echo "(none)"
+    fi
+    rm -f "$good_pairs" "$review_pairs"
+    rm -rf "$CFS_SUMMARY_DIR"
+    CFS_SUMMARY_DIR=""
+}
+
+check_host() {
+    local HOST="$1"
+    local DNS_HINT="${2:-}"
+    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr rc_ssh _tag NL_US NL_UR NL_HN NL_OS RX_HEUR_PATCHED GAPS
+
+    _hl() {
+        local rh="${1:-}"
+        if [[ -n "$rh" && "$rh" != "unknown" && "$rh" != "$HOST" ]]; then
+            printf '%s (%s)' "$HOST" "$rh"
+        elif [[ -n "$DNS_HINT" && "$DNS_HINT" != "$HOST" ]]; then
+            printf '%s (%s)' "$HOST" "$DNS_HINT"
+        else
+            printf '%s' "$HOST"
+        fi
+    }
+
+    _sum_good() {
+        [[ -z "${CFS_SUMMARY_DIR:-}" || -z "${CFS_SUMMARY_SID:-}" ]] && return 0
+        printf 'GOOD\t%s\t%s\n' "$(_hl "${1:-}")" "$2" >"$CFS_SUMMARY_DIR/${CFS_SUMMARY_SID}.sum"
+    }
+    _sum_review() {
+        [[ -z "${CFS_SUMMARY_DIR:-}" || -z "${CFS_SUMMARY_SID:-}" ]] && return 0
+        printf 'REVIEW\t%s\t%s\n' "$(_hl "${1:-}")" "$2" >"$CFS_SUMMARY_DIR/${CFS_SUMMARY_SID}.sum"
+    }
+
+    set +e
+    PRE_REASON="$(preauth_skip_message "$HOST")"
+    pr=$?
+    set -e
+    if [[ $pr -eq 0 && -n "$PRE_REASON" ]]; then
+        echo -e "  $(_hl ""): ${CYA}[SKIP - PRE-AUTH]${NC} ${PRE_REASON}"
+        _sum_review "" "Skipped before SSH: ${PRE_REASON}"
+        return 0
+    fi
+
+    RESULT=""
+    set +e
+    ssh_try_host "$HOST"
+    rc_ssh=$?
+    set -e
+    if [[ $rc_ssh -ne 0 ]]; then
+        echo -e "  $(_hl ""): ${YEL}[SKIP]${NC} ${SSH_LAST_FAILURE_DETAIL:-SSH failed (no detail)}"
+        _sum_review "" "No successful SSH probe: ${SSH_LAST_FAILURE_DETAIL:-SSH failed}"
+        return 0
+    fi
+    RESULT="$SSH_PROBE_RESULT"
+
+    if [[ "$RESULT" == NOTLINUX\|* ]]; then
+        IFS='|' read -r _tag NL_US NL_UR NL_HN NL_OS <<<"$RESULT"
+        echo -e "  $(_hl "$NL_HN"): ${CYA}[SKIP - NOT LINUX]${NC} login OK; uname -s=${NL_US}, uname -r=${NL_UR} | ${NL_OS}"
+        _sum_review "$NL_HN" "Not Linux (${NL_US}); confirm host is in scope for this scan."
+        return 0
+    fi
+
+    IFS='|' read -r KVER DISTRO AEAD_LOADED MITIGATED HNAME ARCH NFCONF NFTSTAT USERNS USYSCTL <<<"$RESULT"
+    parse_kernel "$KVER"
+    local KERNEL_TIER
+    KERNEL_TIER="$(classify_kernel "$KMAJOR" "$KMINOR" "$KPATCH")"
+    local VULN="$KERNEL_TIER"
+    local S2311 S2312
+    S2311="$(summarize_23111 "$KERNEL_TIER" "$NFCONF" "$NFTSTAT" "$USERNS" "$USYSCTL")"
+    S2312="$(summarize_23102 "$KERNEL_TIER" "$ARCH")"
+    local CVE_TAIL=" | 23111=${S2311} | 23102=${S2312}"
+
+    RX_HEUR_PATCHED=0
+    if af_alg_rx_heuristic_ok "$KMAJOR" "$KMINOR" "$KPATCH" "$KVER"; then
+        RX_HEUR_PATCHED=1
+    fi
+
+    if [[ "$AEAD_LOADED" == "no" ]]; then
+        VULN="no-aead-module"
+    fi
+
+    case "$VULN" in
+        vulnerable)
+            GAPS="CVE-2026-31431"
+            [[ "$RX_HEUR_PATCHED" -eq 0 ]] && GAPS="${GAPS}, CVE-2026-31677/CVE-2026-43077"
+            if [[ "$MITIGATED" != "no" ]]; then
+                echo -e "  $(_hl "$HNAME"): ${YEL}[31431 VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
+                _sum_review "$HNAME" "CVE-2026-31431 tier looks affected but algif_aead is mitigated — confirm vendor matrix; review gaps: ${GAPS}"
+            else
+                echo -e "  $(_hl "$HNAME"): ${RED}[31431 LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
+                _sum_review "$HNAME" "Treat as priority: patch kernel for CVE-2026-31431 (and AF_ALG RX if listed); ${GAPS}"
+            fi
+            ;;
+        patched)
+            if [[ "$RX_HEUR_PATCHED" -eq 1 ]]; then
+                echo -e "  $(_hl "$HNAME"): ${GRN}[31431 PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+                _sum_good "$HNAME" "Copy Fail heuristic patched; ${DISTRO} — still confirm *-pve / vendor backports."
+            else
+                echo -e "  $(_hl "$HNAME"): ${RED}[31431 PATCHED — AF_ALG RX GAPS]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL} | gaps: CVE-2026-31677/CVE-2026-43077 (upgrade past NVD floors: e.g. 6.18.24+ / 6.19.14+ on those stable lines)"
+                _sum_review "$HNAME" "Kernel past Copy Fail floor but AF_ALG RX heuristics still flag CVE-2026-31677/43077 — plan upgrade past distro/NVD floors."
+            fi
+            ;;
+        pre-vuln)
+            echo -e "  $(_hl "$HNAME"): ${GRN}[31431 PRE-FIX KERNEL RANGE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+            _sum_good "$HNAME" "Pre-Copy Fail kernel band per heuristic - verify with vendor if this host class matters."
+            ;;
+        no-aead-module)
+            echo -e "  $(_hl "$HNAME"): ${CYA}[31431 NO algif_aead - VERIFY]${NC} ${KVER} | ${DISTRO} (heuristic: module absent; confirm vendor)${CVE_TAIL}"
+            _sum_review "$HNAME" "No algif_aead signal — confirm CVE-2026-31431 exposure with vendor (builtin crypto API / EL kernels differ)."
+            ;;
+        *)
+            echo -e "  $(_hl "$HNAME"): ${YEL}[31431 UNKNOWN]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+            _sum_review "$HNAME" "Kernel tuple not classified — check uname vs distro security notices."
+            ;;
+    esac
+}
+
 # Read SSH identification string (first line) from TCP/22 - no cryptographic auth.
+# Prefer nc -w (bounded wait on connect + read); else timeout+read on /dev/tcp; else legacy /dev/tcp (may hang on filtered hosts).
 read_ssh_banner() {
     local host="$1" line=""
+    local tt="${COPYFAIL_BANNER_TIMEOUT:-3}"
     set +e
-    exec 3<>/dev/tcp/"$host"/22 2>/dev/null
-    if [[ $? -eq 0 ]]; then
-        IFS= read -r -t 4 line <&3
-        exec 3<&-
-        exec 3>&-
+    line=""
+    if command -v nc >/dev/null 2>&1; then
+        line="$(nc -w"$tt" "$host" 22 </dev/null 2>/dev/null | head -1)"
+    elif command -v timeout >/dev/null 2>&1; then
+        line="$(timeout "$((tt + 2))" env CFS_HOST="$host" CFS_TT="$tt" bash -c 'exec 3<>/dev/tcp/"$CFS_HOST"/22 2>/dev/null || exit 1
+IFS= read -r -t "$CFS_TT" line <&3 || true
+printf %s "$line"' 2>/dev/null)"
     else
-        if command -v nc >/dev/null 2>&1; then
-            line="$(nc -w4 "$host" 22 </dev/null 2>/dev/null | head -1)"
+        exec 3<>/dev/tcp/"$host"/22 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            IFS= read -r -t "$tt" line <&3
+            exec 3<&-
+            exec 3>&-
         fi
     fi
     line="${line//$'\r'/}"
@@ -105,6 +343,11 @@ preauth_skip_message() {
                 msg="$msg | banner: $short"
             fi
             printf '%s\n' "$msg"
+            return 0
+        fi
+    else
+        if [[ "$COPYFAIL_NO_BANNER_SKIP_SSH" != "0" ]]; then
+            printf '%s\n' "port 22: no SSH identification within ${COPYFAIL_BANNER_TIMEOUT}s (offline, filtered, or non-SSH) — skipping login"
             return 0
         fi
     fi
@@ -405,7 +648,10 @@ ssh_try_host() {
         errf="${TMPDIR:-/tmp}/cfs-$$-${RANDOM}.err"
         set +e
         out="$(SSHPASS="$pass" sshpass -e ssh \
-            -o ConnectTimeout=5 \
+            -o "ConnectTimeout=${COPYFAIL_SSH_CONNECT_TIMEOUT}" \
+            -o ConnectionAttempts=1 \
+            -o ServerAliveInterval=4 \
+            -o ServerAliveCountMax=1 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
@@ -428,84 +674,6 @@ ssh_try_host() {
     return 1
 }
 
-check_host() {
-    local HOST="$1"
-    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr rc_ssh _tag NL_US NL_UR NL_HN NL_OS RX_HEUR_PATCHED GAPS
-
-    set +e
-    PRE_REASON="$(preauth_skip_message "$HOST")"
-    pr=$?
-    set -e
-    if [[ $pr -eq 0 && -n "$PRE_REASON" ]]; then
-        echo -e "  ${HOST}: ${CYA}[SKIP - PRE-AUTH]${NC} ${PRE_REASON}"
-        return 0
-    fi
-
-    RESULT=""
-    set +e
-    ssh_try_host "$HOST"
-    rc_ssh=$?
-    set -e
-    if [[ $rc_ssh -ne 0 ]]; then
-        echo -e "  ${HOST}: ${YEL}[SKIP]${NC} ${SSH_LAST_FAILURE_DETAIL:-SSH failed (no detail)}"
-        return 0
-    fi
-    RESULT="$SSH_PROBE_RESULT"
-
-    if [[ "$RESULT" == NOTLINUX\|* ]]; then
-        IFS='|' read -r _tag NL_US NL_UR NL_HN NL_OS <<<"$RESULT"
-        echo -e "  ${HOST} (${NL_HN}): ${CYA}[SKIP - NOT LINUX]${NC} login OK; uname -s=${NL_US}, uname -r=${NL_UR} | ${NL_OS}"
-        return 0
-    fi
-
-    IFS='|' read -r KVER DISTRO AEAD_LOADED MITIGATED HNAME ARCH NFCONF NFTSTAT USERNS USYSCTL <<<"$RESULT"
-    parse_kernel "$KVER"
-    local KERNEL_TIER
-    KERNEL_TIER="$(classify_kernel "$KMAJOR" "$KMINOR" "$KPATCH")"
-    local VULN="$KERNEL_TIER"
-    local S2311 S2312
-    S2311="$(summarize_23111 "$KERNEL_TIER" "$NFCONF" "$NFTSTAT" "$USERNS" "$USYSCTL")"
-    S2312="$(summarize_23102 "$KERNEL_TIER" "$ARCH")"
-    local CVE_TAIL=" | 23111=${S2311} | 23102=${S2312}"
-
-    RX_HEUR_PATCHED=0
-    if af_alg_rx_heuristic_ok "$KMAJOR" "$KMINOR" "$KPATCH" "$KVER"; then
-        RX_HEUR_PATCHED=1
-    fi
-
-    if [[ "$AEAD_LOADED" == "no" ]]; then
-        VULN="no-aead-module"
-    fi
-
-    case "$VULN" in
-        vulnerable)
-            GAPS="CVE-2026-31431"
-            [[ "$RX_HEUR_PATCHED" -eq 0 ]] && GAPS="${GAPS}, CVE-2026-31677/CVE-2026-43077"
-            if [[ "$MITIGATED" != "no" ]]; then
-                echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
-            else
-                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
-            fi
-            ;;
-        patched)
-            if [[ "$RX_HEUR_PATCHED" -eq 1 ]]; then
-                echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
-            else
-                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 PATCHED — AF_ALG RX GAPS]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL} | gaps: CVE-2026-31677/CVE-2026-43077 (upgrade past NVD floors: e.g. 6.18.24+ / 6.19.14+ on those stable lines)"
-            fi
-            ;;
-        pre-vuln)
-            echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PRE-FIX KERNEL RANGE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
-            ;;
-        no-aead-module)
-            echo -e "  ${HOST} (${HNAME}): ${CYA}[31431 NO algif_aead - VERIFY]${NC} ${KVER} | ${DISTRO} (heuristic: module absent; confirm vendor)${CVE_TAIL}"
-            ;;
-        *)
-            echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 UNKNOWN]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
-            ;;
-    esac
-}
-
 discover_hosts() {
     local t="$1"
     if [[ -f "$t" ]]; then
@@ -518,7 +686,31 @@ discover_hosts() {
             exit 1
         fi
         echo "[*] nmap TCP discovery (-PS22) on $t ..."
-        mapfile -t HOSTS < <(nmap -sn -PS22 "$t" 2>/dev/null | awk '/Nmap scan report/{print $NF}' | tr -d '()' || true)
+        HOSTS=()
+        local rest ip nm line
+        while IFS= read -r line; do
+            line="${line//$'\r'/}"
+            [[ "$line" =~ ^Nmap\ scan\ report\ for\ (.+)$ ]] || continue
+            rest="${BASH_REMATCH[1]}"
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            rest="${rest%"${rest##*[![:space:]]}"}"
+            # Avoid '(' ')' in [[ ]] patterns: they interact badly with shopt extglob.
+            ip="${rest##*\(}"
+            if [[ "$ip" == "$rest" ]]; then
+                HOSTS+=("$rest")
+                continue
+            fi
+            ip="${ip%\)}"
+            if [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+                nm="${rest%\(*}"
+                nm="${nm%"${nm##*[![:space:]]}"}"
+                nm="${nm#"${nm%%[![:space:]]*}"}"
+                HOSTS+=("$ip")
+                [[ -n "$nm" && "$nm" != "$ip" ]] && CFS_DISPLAY_NAME["$ip"]="$nm"
+            else
+                HOSTS+=("$rest")
+            fi
+        done < <(LANG=C LC_ALL=C nmap -sn -PS22 "$t" 2>/dev/null || true)
         return
     fi
     HOSTS=("$t")
@@ -530,22 +722,95 @@ require_cmds
 echo "=== Linux kernel CVE posture scan v${COPYFAIL_VERSION} ==="
 echo "=== CVEs: 2026-31431 (Copy Fail), 2026-31677/43077 (AF_ALG RX), 2026-23111 (nf_tables), 2026-23102 (arm64 SVE) — heuristics only ==="
 echo "=== CREDS_FILE=${CREDS_FILE} | TARGET=${TARGET} ==="
-echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} ==="
+echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} PARALLEL=${COPYFAIL_PARALLEL} ORDERED_OUT=${COPYFAIL_ORDERED_OUTPUT} SUMMARY=${COPYFAIL_SUMMARY} PTR=${COPYFAIL_PTR_LOOKUP} BANNER_TO=${COPYFAIL_BANNER_TIMEOUT}s SSH_TO=${COPYFAIL_SSH_CONNECT_TIMEOUT}s NO_BANNER_SKIP=${COPYFAIL_NO_BANNER_SKIP_SSH} ==="
 echo ""
 
 discover_hosts "$TARGET"
+cfs_enrich_ptr_labels
 echo "[*] ${#HOSTS[@]} host(s) to probe"
 echo ""
 
-for HOST in "${HOSTS[@]}"; do
+COPYFAIL_RESULT_DIR=""
+CFS_SUMMARY_DIR=""
+if [[ "${COPYFAIL_SUMMARY:-1}" != "0" ]]; then
+    CFS_SUMMARY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cfs-sum.XXXXXX")" || {
+        echo "mktemp failed for summary buffer" >&2
+        exit 1
+    }
+fi
+if (( COPYFAIL_PARALLEL > 1 )) && [[ "$COPYFAIL_ORDERED_OUTPUT" != "0" ]]; then
+    COPYFAIL_RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cfs-results.XXXXXX")" || {
+        echo "mktemp failed for result buffer" >&2
+        exit 1
+    }
+fi
+if [[ -n "${COPYFAIL_RESULT_DIR:-}" || -n "${CFS_SUMMARY_DIR:-}" ]]; then
+    trap '_cfs_tmp_cleanup' EXIT INT HUP TERM
+fi
+
+# Emit buffered lines in probe order as soon as each prefix of jobs has finished.
+cfs_emit_next=0
+declare -A cfs_done
+cfs_mark_done() {
+    local fin="$1"
+    [[ -n "${COPYFAIL_RESULT_DIR:-}" ]] || return 0
+    cfs_done[$fin]=1
+    while [[ -n "${cfs_done[$cfs_emit_next]:-}" ]]; do
+        [[ -f "$COPYFAIL_RESULT_DIR/$cfs_emit_next.log" ]] && cat "$COPYFAIL_RESULT_DIR/$cfs_emit_next.log"
+        rm -f "$COPYFAIL_RESULT_DIR/$cfs_emit_next.log"
+        unset "cfs_done[$cfs_emit_next]"
+        ((cfs_emit_next++)) || true
+    done
+}
+
+cfs_drain_one_job() {
+    wait "${pids[0]}"
+    cfs_mark_done "${job_sid[0]}"
+    _qp=() _qs=()
+    for ((_qi = 1; _qi < ${#pids[@]}; _qi++)); do
+        _qp+=("${pids[_qi]}")
+        _qs+=("${job_sid[_qi]}")
+    done
+    pids=("${_qp[@]}")
+    job_sid=("${_qs[@]}")
+}
+
+pids=()
+job_sid=()
+cfs_spawn_id=0
+for _idx in "${!HOSTS[@]}"; do
+    HOST="${HOSTS[_idx]}"
     [[ -z "${HOST// }" ]] && continue
-    check_host "$HOST"
+    while (( ${#pids[@]} >= COPYFAIL_PARALLEL )); do
+        cfs_drain_one_job
+    done
+    _sid=$cfs_spawn_id
+    ((cfs_spawn_id++)) || true
+    if [[ -n "${COPYFAIL_RESULT_DIR:-}" ]]; then
+        CFS_SUMMARY_SID="$_sid" CFS_SUMMARY_DIR="${CFS_SUMMARY_DIR:-}" \
+            check_host "$HOST" "${CFS_DISPLAY_NAME[$HOST]:-}" >"$COPYFAIL_RESULT_DIR/$_sid.log" 2>&1 &
+    else
+        CFS_SUMMARY_SID="$_sid" CFS_SUMMARY_DIR="${CFS_SUMMARY_DIR:-}" check_host "$HOST" "${CFS_DISPLAY_NAME[$HOST]:-}" &
+    fi
+    pids+=($!)
+    job_sid+=("$_sid")
 done
+while (( ${#pids[@]} > 0 )); do
+    cfs_drain_one_job
+done
+
+if [[ -n "${COPYFAIL_RESULT_DIR:-}" ]]; then
+    rm -rf "$COPYFAIL_RESULT_DIR"
+    COPYFAIL_RESULT_DIR=""
+fi
 
 echo ""
 echo "=== Scan complete ==="
+cfs_render_summary
+echo ""
 echo "Heuristics only — confirm each CVE with your distributor (especially *-pve / backported kernels)."
 echo "CVE-2026-31677 NVD floors (upstream tuple): 6.12.83+, 6.18.24+, 6.19.14+; 7.0-rc* may still be affected."
 echo "CVE-2026-31431 mitigation (module loadable): echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf && sudo rmmod algif_aead 2>/dev/null"
 echo "CVE-2026-23111: often mitigated by disabling unprivileged user namespaces (sysctl) and/or patching; see vendor guidance for nftables."
 echo "Builtin crypto API (common on some EL kernels): use initcall_blacklist=algif_aead_init on the kernel cmdline - see vendor docs."
+echo "Missed live SSH hosts? Try COPYFAIL_NO_BANNER_SKIP_SSH=0 and/or COPYFAIL_BANNER_TIMEOUT=8."
