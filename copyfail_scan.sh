@@ -3,10 +3,11 @@
 # Multi-CVE Linux kernel posture helper (SSH read-only probes; no exploits).
 # Covers: CVE-2026-31431 (Copy Fail / AF_ALG), CVE-2026-23111 (nf_tables + user_ns),
 #         CVE-2026-23102 (ARM64 SVE/SME signal restore) — all heuristics; confirm with vendor.
+# Also flags AF_ALG RX-side gaps (CVE-2026-31677, CVE-2026-43077 — verify with kernel.org / your vendor).
 #
 # Usage:
 #   CREDS_FILE=/path/to/creds ./copyfail_scan.sh [TARGET]
-# Probes: CVE-2026-31431 (algif_aead), CVE-2026-23111 (nf_tables+userns), CVE-2026-23102 (arm64 SVE) — heuristics only.
+# Probes: CVE-2026-31431 (algif_aead), CVE-2026-31677/43077 (AF_ALG RX heuristics), CVE-2026-23111 (nf_tables+userns), CVE-2026-23102 (arm64 SVE) — heuristics only.
 #
 # TARGET:
 #   - CIDR (e.g. 192.168.54.0/23) - requires nmap
@@ -297,6 +298,37 @@ summarize_23102() {
     echo "CHECK(CVE-2026-23102)"
 }
 
+# CVE-2026-31677 (NVD): AF_ALG RX scatterlist vs receive buffer; floors include 6.12.83, 6.18.24, 6.19.14; 7.0-rc* listed affected.
+# Returns 0 if heuristic says RX-side fixes are present, 1 if likely still missing (upstream version tuple).
+af_alg_rx_heuristic_ok() {
+    local km="$1" kn="$2" kp="$3" kver="$4"
+    if [[ "$kver" =~ 7\.0\.[0-9]+-rc ]]; then
+        return 1
+    fi
+    if (( km < 4 || (km == 4 && kn < 14) )); then
+        return 0
+    fi
+    if (( km >= 7 )); then
+        return 0
+    fi
+    if (( km == 6 )); then
+        if (( kn > 19 )); then
+            return 0
+        fi
+        if (( kn == 19 && kp >= 14 )); then
+            return 0
+        fi
+        if (( kn == 18 && kp >= 24 )); then
+            return 0
+        fi
+        if (( kn == 12 && kp >= 83 )); then
+            return 0
+        fi
+        return 1
+    fi
+    return 1
+}
+
 # Summarize ssh/sshpass stderr for operators (auth vs network vs other).
 classify_ssh_failure() {
     local rc="$1"
@@ -398,7 +430,7 @@ ssh_try_host() {
 
 check_host() {
     local HOST="$1"
-    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr rc_ssh _tag NL_US NL_UR NL_HN NL_OS
+    local RESULT KVER DISTRO AEAD_LOADED MITIGATED HNAME VULN PRE_REASON pr rc_ssh _tag NL_US NL_UR NL_HN NL_OS RX_HEUR_PATCHED GAPS
 
     set +e
     PRE_REASON="$(preauth_skip_message "$HOST")"
@@ -436,20 +468,31 @@ check_host() {
     S2312="$(summarize_23102 "$KERNEL_TIER" "$ARCH")"
     local CVE_TAIL=" | 23111=${S2311} | 23102=${S2312}"
 
+    RX_HEUR_PATCHED=0
+    if af_alg_rx_heuristic_ok "$KMAJOR" "$KMINOR" "$KPATCH" "$KVER"; then
+        RX_HEUR_PATCHED=1
+    fi
+
     if [[ "$AEAD_LOADED" == "no" ]]; then
         VULN="no-aead-module"
     fi
 
     case "$VULN" in
         vulnerable)
+            GAPS="CVE-2026-31431"
+            [[ "$RX_HEUR_PATCHED" -eq 0 ]] && GAPS="${GAPS}, CVE-2026-31677/CVE-2026-43077"
             if [[ "$MITIGATED" != "no" ]]; then
-                echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+                echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
             else
-                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}${GAPS:+ | gaps: $GAPS}"
             fi
             ;;
         patched)
-            echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+            if [[ "$RX_HEUR_PATCHED" -eq 1 ]]; then
+                echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
+            else
+                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 PATCHED — AF_ALG RX GAPS]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL} | gaps: CVE-2026-31677/CVE-2026-43077 (upgrade past NVD floors: e.g. 6.18.24+ / 6.19.14+ on those stable lines)"
+            fi
             ;;
         pre-vuln)
             echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PRE-FIX KERNEL RANGE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
@@ -485,7 +528,7 @@ require_file
 require_cmds
 
 echo "=== Linux kernel CVE posture scan v${COPYFAIL_VERSION} ==="
-echo "=== CVEs: 2026-31431 (Copy Fail), 2026-23111 (nf_tables), 2026-23102 (arm64 SVE) — heuristics only ==="
+echo "=== CVEs: 2026-31431 (Copy Fail), 2026-31677/43077 (AF_ALG RX), 2026-23111 (nf_tables), 2026-23102 (arm64 SVE) — heuristics only ==="
 echo "=== CREDS_FILE=${CREDS_FILE} | TARGET=${TARGET} ==="
 echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} ==="
 echo ""
@@ -502,6 +545,7 @@ done
 echo ""
 echo "=== Scan complete ==="
 echo "Heuristics only — confirm each CVE with your distributor (especially *-pve / backported kernels)."
+echo "CVE-2026-31677 NVD floors (upstream tuple): 6.12.83+, 6.18.24+, 6.19.14+; 7.0-rc* may still be affected."
 echo "CVE-2026-31431 mitigation (module loadable): echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf && sudo rmmod algif_aead 2>/dev/null"
 echo "CVE-2026-23111: often mitigated by disabling unprivileged user namespaces (sysctl) and/or patching; see vendor guidance for nftables."
 echo "Builtin crypto API (common on some EL kernels): use initcall_blacklist=algif_aead_init on the kernel cmdline - see vendor docs."
