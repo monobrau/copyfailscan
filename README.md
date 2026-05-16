@@ -1,19 +1,29 @@
-# CVE-2026-31431 (“Copy Fail”) LAN posture scanner
+# Linux kernel LAN posture scanner (multi-CVE heuristics)
 
-`copyfail_scan.sh` inventories **Linux kernel versions**, **`algif_aead` presence** (loaded / loadable / built-in per probe), and **simple mitigations** on hosts you can reach over **SSH**. It does **not** run an exploit or proof-of-concept code.
+`copyfail_scan.sh` inventories **Linux** hosts over **SSH** (read-only probes): **CVE-2026-31431** (Copy Fail / `algif_aead`), **CVE-2026-23111** (nf_tables + user namespaces), and **CVE-2026-23102** (ARM64 SVE/SME). It does **not** run exploits.
 
-**CVE scope:** CVE-2026-31431 is a **local** privilege escalation in the kernel crypto userspace API (`algif_aead`). It is not remote code execution by itself. Treat credentials, the credentials file, and scan output as sensitive.
+**Scope:** these are primarily **local** kernel issues (an attacker usually needs a user account on the host). Treat credentials and output as sensitive.
 
-**Version:** current release **[v1.1.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.1.0)** (GitHub Releases). See **Changes in v1.1.0** below.
+**Version:** current release **[v1.2.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.2.0)** (GitHub Releases). See **Changes in v1.2.0** below.
+
+### Changes in v1.2.0
+
+- **CVE-2026-23111** ([NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-23111)): tail shows `23111=…` from `/boot/config-*`, `nf_tables` module state, `CONFIG_USER_NS`, and `kernel.unprivileged_userns_clone`.
+- **CVE-2026-23102** ([NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-23102)): tail shows `23102=…` on **aarch64/arm64** only (otherwise `n/a(not-arm64)`).
+- **CVE-2026-31431** ([NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-31431)): status tags now prefixed with **`31431`** for clarity.
 
 ### Changes in v1.1.0
 
 - **Pre-auth:** optional skip of obvious non-Linux targets via SSH **banner** (and optional **`nmap -sV -p22`** with `COPYFAIL_PREAUTH_NMAP=1`) before `sshpass`.
-- **Clearer failures:** distinguish **bad credentials** vs **network/DNS/TCP** vs **CREDS not readable**; **no silent exit** if `/etc/copyfail-creds` is root-only and you run without `sudo` (script checks **read** access up front; **safe** creds file open in `ssh_try_host`).
-- **After login:** **`[SKIP - NOT LINUX]`** when `uname -s` ≠ `Linux` (e.g. macOS/Windows Git Bash) even if SSH works.
-- **Robustness:** removed leaked **`set -e`** inside SSH loops that could abort the scan mid-run with no output.
+- **Clearer failures:** distinguish **bad credentials** vs **network/DNS/TCP** vs **CREDS not readable**; **no silent exit** if `/etc/copyfail-creds` is root-only and you run without `sudo`.
+- **After login:** **`[SKIP - NOT LINUX]`** when `uname -s` ≠ `Linux`.
+- **Robustness:** removed leaked **`set -e`** inside SSH loops.
 
-Older release: [v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0).
+Older releases: [v1.1.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.1.0), [v1.0.0](https://github.com/monobrau/copyfailscan/releases/tag/v1.0.0).
+
+### Note on “CVE-2026-1042” and io_uring
+
+Some **blog posts** label a critical **io_uring** issue as “CVE-2026-1042”. In **NVD**, [CVE-2026-1042](https://nvd.nist.gov/vuln/detail/CVE-2026-1042) is currently a **WordPress plugin** (Hello Bar), **not** the Linux kernel. This repo does **not** scan for that ID. Use **kernel.org / distro advisories** for io_uring issues under the **correct CVE** assigned to the kernel.
 
 ## Requirements
 
@@ -27,7 +37,7 @@ Scanning a **single IP or hostname** does not require `nmap` **unless** you enab
 
 ## Pre-auth filtering (before SSH)
 
-This CVE applies to the **Linux kernel**, so the script tries to avoid wasting credential attempts on obvious non-Linux SSH servers.
+These checks apply to **Linux-oriented** scanning, so the script tries to avoid wasting credential attempts on obvious non-Linux SSH servers.
 
 1. **SSH banner (default, fast)** — Opens **TCP/22** and reads the SSH identification string (RFC 4253 first line, no crypto handshake). If it matches common patterns (**Windows** / Microsoft OpenSSH, **Cygwin**, many **network appliances**), the host is reported as **`[SKIP - PRE-AUTH]`** and **never** runs `sshpass`.
 
@@ -101,21 +111,38 @@ COPYFAIL_PREAUTH_NMAP=1 CREDS_FILE=/etc/copyfail-creds sudo ./copyfail_scan.sh 1
 
 ## Output legend
 
-Strings below match what the current script prints (ANSI colors in the terminal).
+Strings below match what **v1.2.0** prints (ANSI colors in the terminal).
+
+### CVE-2026-31431 (Copy Fail) tags
 
 | Tag | Meaning |
 |-----|--------|
-| **SKIP - PRE-AUTH** | Host skipped **before** SSH: SSH banner (and optionally `nmap -sV`) matched **non-Linux** / **non-target** patterns (Windows, Cygwin, common appliances, or macOS via `nmap` when enabled). |
-| **LIKELY VULNERABLE** | Kernel matches the script’s **heuristic** “affected” branch **and** `algif_aead` appears present (`loaded`, `loadable`, or `builtin`). **Confirm** with your distributor’s security advisory. |
-| **VULN - MITIGATED** | Same idea as vulnerable kernel band, but `/etc/modprobe.d` or `initcall_blacklist=algif_aead_init` on the kernel cmdline was detected. |
-| **PATCHED / LIKELY OK** | Heuristic says fixed (e.g. **6.18.22+**, **6.19.12+**, **6.20+** within 6.x, or **7.x**). Distro backports may still use unusual `uname -r` strings—verify with your vendor. |
-| **PRE-FIX KERNEL RANGE** | Heuristic treats kernel as older than the affected floor used by this script (approx. **4.14** floor in the script’s `classify_kernel` logic). |
-| **NO algif_aead - VERIFY** | Probe did not see `algif_aead` via `lsmod`, `modinfo`, or `/boot/config-$(uname -r)`. Could be a minimal image or odd config—**do not** assume “safe” without checking the advisory and kernel package. |
-| **UNKNOWN** | Heuristic could not classify the kernel triplet. |
-| **SKIP - NOT LINUX** | **SSH login succeeded** (a credential worked) but `uname -s` is not `Linux` (e.g. **macOS**, **Windows** Git Bash/MSYS, or **BSD**). This CVE targets the **Linux** kernel only. |
-| **SKIP** | **No** credential succeeded. The line explains **why** when possible: e.g. **SSH authentication failed** for every entry in `CREDS_FILE` (wrong password, unknown user, key-only account), **TCP refused/timeout**, **DNS failure**, **bash missing** on the remote, or another SSH error. |
+| **SKIP - PRE-AUTH** | Host skipped **before** SSH: SSH banner (and optionally `nmap -sV`) matched **non-Linux** / **non-target** patterns. |
+| **31431 LIKELY VULNERABLE** | Kernel matches the script’s **heuristic** “affected” branch **and** `algif_aead` appears present. **Confirm** with your distributor. |
+| **31431 VULN - MITIGATED** | Same kernel band, but `algif_aead` mitigations were detected. |
+| **31431 PATCHED / LIKELY OK** | Heuristic says fixed (upstream-style **6.18.22+**, **6.19.12+**, **6.20+** on 6.x, or **7.x**). **Backports** (e.g. `*-pve`) may still show older `uname` — verify packages. |
+| **31431 PRE-FIX KERNEL RANGE** | Heuristic treats kernel as older than the **~4.14** floor used by the script. |
+| **31431 NO algif_aead - VERIFY** | Probe did not see `algif_aead` — **do not** assume safe without checking the advisory. |
+| **31431 UNKNOWN** | Heuristic could not classify the kernel triplet. |
+| **SKIP - NOT LINUX** | SSH login worked but `uname -s` ≠ `Linux`. |
+| **SKIP** | No credential succeeded; line explains **auth / TCP / DNS / creds file** when possible. |
 
-Remote facts collected per host (when Linux): `uname -r`, `PRETTY_NAME` from `/etc/os-release`, `hostname`, `algif_aead` signals, mitigation hints.
+### Trailing `23111=` / `23102=` fields (v1.2.0+)
+
+Each Linux result line ends with **`| 23111=… | 23102=…`** (no ANSI inside these tokens):
+
+| Token | Meaning (heuristic) |
+|-------|---------------------|
+| `23111=ok(kernel-tier)` | Kernel tier looks **patched or pre-affected** for the script’s coarse map — **still** confirm CVE-2026-23111 with your vendor. |
+| `23111=low(no-nf_tables)` | No `nf_tables` build or module signal — attack surface for that CVE is **reduced** in this probe’s view. |
+| `23111=low(no-CONFIG_USER_NS)` | `CONFIG_USER_NS` not **y** in `/boot/config-*` (if readable). |
+| `23111=reduced(unpriv-userns-disabled)` | `kernel.unprivileged_userns_clone=0` — common hardening; **reduces** typical 23111 exploit paths. |
+| `23111=CHECK(CVE-2026-23111)` | **nftables + user_ns signals** and kernel tier **not** in the script’s “safe” bucket — **review** [CVE-2026-23111](https://nvd.nist.gov/vuln/detail/CVE-2026-23111) / distro matrix. |
+| `23102=n/a(not-arm64)` | CVE-2026-23102 is **ARM64**-specific ([NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-23102)). |
+| `23102=ok(kernel-tier)` | On arm64, kernel tier looks patched/pre-range in this script’s map. |
+| `23102=CHECK(CVE-2026-23102)` | On arm64, tier suggests **review** SVE/SME fixes with your vendor. |
+
+Remote facts collected (when Linux): `uname -r`, `PRETTY_NAME`, `hostname`, **31431** `algif_aead` + mitigations, **`uname -m`**, `/boot/config-*` snippets for **NF_TABLES** / **USER_NS**, `nf_tables` load state, **`kernel.unprivileged_userns_clone`**.
 
 ## Kernel heuristic
 

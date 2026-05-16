@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# CVE-2026-31431 ("Copy Fail") - LAN-oriented posture check via SSH.
-# Discovers live hosts (TCP/22 probe), then runs a read-only remote probe:
-# kernel version, algif_aead presence, optional mitigations. Does NOT run an exploit.
+# Multi-CVE Linux kernel posture helper (SSH read-only probes; no exploits).
+# Covers: CVE-2026-31431 (Copy Fail / AF_ALG), CVE-2026-23111 (nf_tables + user_ns),
+#         CVE-2026-23102 (ARM64 SVE/SME signal restore) — all heuristics; confirm with vendor.
 #
 # Usage:
 #   CREDS_FILE=/path/to/creds ./copyfail_scan.sh [TARGET]
+# Probes: CVE-2026-31431 (algif_aead), CVE-2026-23111 (nf_tables+userns), CVE-2026-23102 (arm64 SVE) — heuristics only.
 #
 # TARGET:
 #   - CIDR (e.g. 192.168.54.0/23) - requires nmap
@@ -24,7 +25,7 @@ CREDS_FILE="${CREDS_FILE:-/etc/copyfail-creds}"
 COPYFAIL_PREAUTH="${COPYFAIL_PREAUTH:-1}"
 COPYFAIL_PREAUTH_NMAP="${COPYFAIL_PREAUTH_NMAP:-0}"
 COPYFAIL_PREAUTH_VERBOSE="${COPYFAIL_PREAUTH_VERBOSE:-0}"
-COPYFAIL_VERSION="1.1.0"
+COPYFAIL_VERSION="1.2.0"
 
 RED='\033[0;31m'
 YEL='\033[1;33m'
@@ -143,7 +144,31 @@ elif grep -q "initcall_blacklist=algif_aead_init" /proc/cmdline 2>/dev/null; the
     MITIGATED="grub-blacklisted"
 fi
 
-echo "${KVER}|${DISTRO}|${AEAD_LOADED}|${MITIGATED}|${HNAME}"'
+ARCH=$(uname -m 2>/dev/null || echo unknown)
+BCFG="/boot/config-${KVER}"
+NFCONF="unk"
+NFTSTAT="no"
+USERNS="unk"
+USYSCTL="unk"
+if [[ -r "$BCFG" ]]; then
+    NFCONF="n"
+    grep -q "^CONFIG_NF_TABLES=y" "$BCFG" && NFCONF=y
+    [[ "$NFCONF" == "n" ]] && grep -q "^CONFIG_NF_TABLES=m" "$BCFG" && NFCONF=m
+    USERNS="n"
+    grep -q "^CONFIG_USER_NS=y" "$BCFG" && USERNS=y
+fi
+if lsmod 2>/dev/null | grep -qE "^nf_tables[[:space:]]"; then
+    NFTSTAT="loaded"
+elif modinfo nf_tables >/dev/null 2>&1; then
+    NFTSTAT="loadable"
+fi
+if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]]; then
+    USYSCTL=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)
+else
+    USYSCTL="absent"
+fi
+
+echo "${KVER}|${DISTRO}|${AEAD_LOADED}|${MITIGATED}|${HNAME}|${ARCH}|${NFCONF}|${NFTSTAT}|${USERNS}|${USYSCTL}"'
 
 require_file() {
     if [[ ! -f "$CREDS_FILE" ]]; then
@@ -231,6 +256,45 @@ classify_kernel() {
         return
     fi
     echo "unknown"
+}
+
+# CVE-2026-23111 (nf_tables catchall UAF) — NVD: exploitable with user namespaces + nftables on affected kernels.
+summarize_23111() {
+    local tier="$1" nfconf="$2" nft="$3" uns="$4" uclone="$5"
+    if [[ "$tier" == "patched" || "$tier" == "pre-vuln" ]]; then
+        echo "ok(kernel-tier)"
+        return 0
+    fi
+    local nft_ok=0
+    [[ "$nfconf" == "y" || "$nfconf" == "m" ]] && nft_ok=1
+    [[ "$nft" == "loaded" || "$nft" == "loadable" ]] && nft_ok=1
+    if [[ $nft_ok -eq 0 ]]; then
+        echo "low(no-nf_tables)"
+        return 0
+    fi
+    if [[ "$uns" != "y" ]]; then
+        echo "low(no-CONFIG_USER_NS)"
+        return 0
+    fi
+    if [[ "$uclone" == "0" ]]; then
+        echo "reduced(unpriv-userns-disabled)"
+        return 0
+    fi
+    echo "CHECK(CVE-2026-23111)"
+}
+
+# CVE-2026-23102 (ARM64 SVE/SME signal context) — NVD: arm64 only.
+summarize_23102() {
+    local tier="$1" arch="$2"
+    if [[ "$arch" != "aarch64" && "$arch" != "arm64" ]]; then
+        echo "n/a(not-arm64)"
+        return 0
+    fi
+    if [[ "$tier" == "patched" || "$tier" == "pre-vuln" ]]; then
+        echo "ok(kernel-tier)"
+        return 0
+    fi
+    echo "CHECK(CVE-2026-23102)"
 }
 
 # Summarize ssh/sshpass stderr for operators (auth vs network vs other).
@@ -362,9 +426,15 @@ check_host() {
         return 0
     fi
 
-    IFS='|' read -r KVER DISTRO AEAD_LOADED MITIGATED HNAME <<<"$RESULT"
+    IFS='|' read -r KVER DISTRO AEAD_LOADED MITIGATED HNAME ARCH NFCONF NFTSTAT USERNS USYSCTL <<<"$RESULT"
     parse_kernel "$KVER"
-    VULN="$(classify_kernel "$KMAJOR" "$KMINOR" "$KPATCH")"
+    local KERNEL_TIER
+    KERNEL_TIER="$(classify_kernel "$KMAJOR" "$KMINOR" "$KPATCH")"
+    local VULN="$KERNEL_TIER"
+    local S2311 S2312
+    S2311="$(summarize_23111 "$KERNEL_TIER" "$NFCONF" "$NFTSTAT" "$USERNS" "$USYSCTL")"
+    S2312="$(summarize_23102 "$KERNEL_TIER" "$ARCH")"
+    local CVE_TAIL=" | 23111=${S2311} | 23102=${S2312}"
 
     if [[ "$AEAD_LOADED" == "no" ]]; then
         VULN="no-aead-module"
@@ -373,22 +443,22 @@ check_host() {
     case "$VULN" in
         vulnerable)
             if [[ "$MITIGATED" != "no" ]]; then
-                echo -e "  ${HOST} (${HNAME}): ${YEL}[VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}"
+                echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 VULN - MITIGATED]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
             else
-                echo -e "  ${HOST} (${HNAME}): ${RED}[LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}"
+                echo -e "  ${HOST} (${HNAME}): ${RED}[31431 LIKELY VULNERABLE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
             fi
             ;;
         patched)
-            echo -e "  ${HOST} (${HNAME}): ${GRN}[PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}"
+            echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PATCHED / LIKELY OK]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
             ;;
         pre-vuln)
-            echo -e "  ${HOST} (${HNAME}): ${GRN}[PRE-FIX KERNEL RANGE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}"
+            echo -e "  ${HOST} (${HNAME}): ${GRN}[31431 PRE-FIX KERNEL RANGE]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
             ;;
         no-aead-module)
-            echo -e "  ${HOST} (${HNAME}): ${CYA}[NO algif_aead - VERIFY]${NC} ${KVER} | ${DISTRO} (heuristic: module absent; confirm with vendor advisory / patched kernel)"
+            echo -e "  ${HOST} (${HNAME}): ${CYA}[31431 NO algif_aead - VERIFY]${NC} ${KVER} | ${DISTRO} (heuristic: module absent; confirm vendor)${CVE_TAIL}"
             ;;
         *)
-            echo -e "  ${HOST} (${HNAME}): ${YEL}[UNKNOWN]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}"
+            echo -e "  ${HOST} (${HNAME}): ${YEL}[31431 UNKNOWN]${NC} ${KVER} | aead=${AEAD_LOADED} | ${DISTRO}${CVE_TAIL}"
             ;;
     esac
 }
@@ -414,7 +484,8 @@ discover_hosts() {
 require_file
 require_cmds
 
-echo "=== CVE-2026-31431 (Copy Fail) posture scan v${COPYFAIL_VERSION} ==="
+echo "=== Linux kernel CVE posture scan v${COPYFAIL_VERSION} ==="
+echo "=== CVEs: 2026-31431 (Copy Fail), 2026-23111 (nf_tables), 2026-23102 (arm64 SVE) — heuristics only ==="
 echo "=== CREDS_FILE=${CREDS_FILE} | TARGET=${TARGET} ==="
 echo "=== PREAUTH=${COPYFAIL_PREAUTH} PREAUTH_NMAP=${COPYFAIL_PREAUTH_NMAP} ==="
 echo ""
@@ -430,6 +501,7 @@ done
 
 echo ""
 echo "=== Scan complete ==="
-echo "Heuristic only - verify with distro security notices and patched kernels."
-echo "Mitigation (module loadable): echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf && sudo rmmod algif_aead 2>/dev/null"
+echo "Heuristics only — confirm each CVE with your distributor (especially *-pve / backported kernels)."
+echo "CVE-2026-31431 mitigation (module loadable): echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf && sudo rmmod algif_aead 2>/dev/null"
+echo "CVE-2026-23111: often mitigated by disabling unprivileged user namespaces (sysctl) and/or patching; see vendor guidance for nftables."
 echo "Builtin crypto API (common on some EL kernels): use initcall_blacklist=algif_aead_init on the kernel cmdline - see vendor docs."
